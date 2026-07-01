@@ -13,13 +13,12 @@ from aiogram.types import InlineKeyboardButton, LabeledPrice, ContentType
 from telethon import TelegramClient, errors
 
 # الإعدادات
-API_TOKEN         = '8326286321:AAHaxW5O8C9Ujfsx22ERDSoWdlT1D2sbeJw'
+API_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_USERNAME    = 'DYD55'
 SUB_ADMIN_USERNAMES = []
 BOT_USERNAME      = 'Kaido_TG_KINGbot'
-TELETHON_API_ID   = 34674538
-TELETHON_API_HASH = '633785a3287407336e4c7421307fcbd8'
-
+TELETHON_API_ID = int(os.getenv('TELETHON_API_ID'))
+TELETHON_API_HASH = os.getenv('TELETHON_API_HASH')
 ACTIVATIONS_CHANNEL = ''
 SUBSCRIBE_CHANNELS  = ['@TGNUMERS', '@TGFRANK1']
 
