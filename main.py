@@ -16,11 +16,12 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = "8661589595:AAEh22n0-Od7pMJxsLT7GORHOyAWX4PFWsU"          # استبدله بتوكن بوت تيليجرام
+# التوكن: يُفضل استخدام متغير بيئة، وإلا استخدم القيمة المباشرة
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8661589595:AAEh22n0-Od7pMJxsLT7GORHOyAWX4PFWsU")
 TARGET_URL = "https://www.fasah.sa"    # رابط الموقع الرسمي
 
-# يفضل ترك headless=False لتجربة المتصفح، وللموبايل اجعلها True
-HEADLESS_MODE = False
+# الوضع المخفي: True للتشغيل على السيرفرات (مثل Railway)، False للتجارب المحلية
+HEADLESS_MODE = os.getenv("HEADLESS", "true").lower() == "true"
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -28,7 +29,7 @@ USER_AGENTS = [
 ]
 VIEWPORT = {"width": 1366, "height": 768}
 
-# ================== تخزين الحسابات (إيميلات فقط) ==================
+# ================== تخزين الحسابات ==================
 ACCOUNTS_FILE = Path("accounts.json")
 if not ACCOUNTS_FILE.exists():
     ACCOUNTS_FILE.write_text("{}", encoding="utf-8")
@@ -48,10 +49,18 @@ user_pages = {}      # {user_id: page}
 async def get_browser_context(user_id: str):
     if user_id not in user_browsers:
         p = await async_playwright().start()
-        browser = await p.chromium.launch(
-            headless=HEADLESS_MODE,
-            args=["--disable-blink-features=AutomationControlled"]
-        )
+        try:
+            browser = await p.chromium.launch(
+                headless=HEADLESS_MODE,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage"
+                ]
+            )
+        except Exception as e:
+            logger.error(f"فشل تشغيل المتصفح: {e}")
+            raise
         context = await browser.new_context(
             user_agent=random.choice(USER_AGENTS),
             viewport=VIEWPORT,
@@ -182,10 +191,10 @@ async def process_new_password(message: types.Message, state: FSMContext):
     email = data["email"]
     user_id = str(message.from_user.id)
 
-    page = await get_page(user_id)
-    await page.goto(TARGET_URL, wait_until="domcontentloaded")
     try:
-        # ابحث عن حقول الإدخال (قد تكون من نوع email/ password)
+        page = await get_page(user_id)
+        await page.goto(TARGET_URL, wait_until="domcontentloaded")
+        # ابحث عن حقول الإدخال
         await page.fill("input[type='email'], input[name='email'], input#email", email)
         await page.fill("input[type='password'], input[name='password'], input#password", password)
         await human_click(page, "button:has-text('دخول'), button:has-text('تسجيل الدخول')")
@@ -193,7 +202,6 @@ async def process_new_password(message: types.Message, state: FSMContext):
         await human_delay(1000, 2000)
 
         if await page.query_selector("text=تسجيل الخروج") or await page.query_selector("text=حسابي"):
-            # حفظ الحساب
             accounts = load_accounts()
             if user_id not in accounts:
                 accounts[user_id] = []
@@ -204,10 +212,11 @@ async def process_new_password(message: types.Message, state: FSMContext):
             await message.answer("تم تسجيل الدخول بنجاح!")
             await ask_purpose(message, state)
         else:
-            await message.answer("فشل الدخول، تحقق من البيانات.")
+            await message.answer("فشل الدخول، تحقق من البيانات أو أعد المحاولة لاحقًا.")
             await state.clear()
     except Exception as e:
-        await message.answer(f"خطأ أثناء الدخول: {e}")
+        logger.error(f"خطأ تسجيل الدخول: {e}")
+        await message.answer(f"حدث خطأ أثناء الدخول. تأكد من صحة البيانات وحاول مجددًا.")
         await state.clear()
 
 # ---------- سؤال الغرض ----------
@@ -224,9 +233,7 @@ async def purpose_chosen(message: types.Message, state: FSMContext):
     user_id = str(message.from_user.id)
     page = await get_page(user_id)
     try:
-        # سنكرر التنقل حتى الوصول لصفحة الخيارات بعد الغرض
         await go_until_extra_options(page, purpose)
-        # استخراج القوائم أو الخيارات (قد تكون select أو راديو)
         options_raw = await page.evaluate('''() => {
             const selects = document.querySelectorAll('select');
             if (selects.length > 0) {
@@ -236,7 +243,6 @@ async def purpose_chosen(message: types.Message, state: FSMContext):
                     options: Array.from(s.options).map(o => ({text: o.text, value: o.value}))
                 }));
             }
-            // إن لم تكن select، نبحث عن مجموعة أزرار راديو
             const radioGroups = document.querySelectorAll('.form-group, .radio-group');
             return Array.from(radioGroups).map(g => ({
                 name: g.querySelector('label')?.innerText || 'خيار',
@@ -249,7 +255,6 @@ async def purpose_chosen(message: types.Message, state: FSMContext):
 
         if options_raw and len(options_raw) > 0:
             await state.update_data(extra_options_raw=options_raw)
-            # عرض الخيار الأول (لتبسيط التفاعل؛ يمكن تطويره لاحقًا)
             first = options_raw[0]
             opts_text = "\n".join([f"{i+1}. {o['text']}" for i, o in enumerate(first['options'])])
             await message.answer(f"اختر قيمة لـ \"{first['name']}\":\n{opts_text}\n(أرسل الرقم أو النص)")
@@ -258,26 +263,22 @@ async def purpose_chosen(message: types.Message, state: FSMContext):
             await message.answer("لا توجد خيارات إضافية. أدخل التاريخ (YYYY-MM-DD):")
             await state.set_state(BookingStates.waiting_for_date)
     except Exception as e:
-        await message.answer(f"خطأ أثناء جلب الخيارات: {e}")
+        logger.error(f"خطأ في جلب الخيارات: {e}")
+        await message.answer("حدث خطأ أثناء تجهيز الخيارات. يرجى المحاولة لاحقًا.")
         await state.clear()
 
 async def go_until_extra_options(page, purpose):
-    """ينتقل من الصفحة الرئيسية إلى ما بعد اختيار الغرض (قبل المواعيد)"""
     await page.goto(TARGET_URL, wait_until="domcontentloaded")
     await human_delay(500, 800)
-    # الدخول إلى مواعيد الشاحنات (قد يكون رابط أو زر)
     await human_click(page, "a:has-text('مواعيد الشاحنات'), button:has-text('مواعيد الشاحنات')")
     await human_delay(600, 900)
-    # حجز جديد
     await human_click(page, "a:has-text('حجز جديد'), button:has-text('حجز جديد')")
     await human_delay(600, 900)
-    # اختيار الغرض (فارغة أو عبور) - قد يكونان أزرارًا أو روابط
     if purpose == "شاحنة فارغة":
         await human_click(page, "text=شاحنة فارغة")
     else:
         await human_click(page, "text=عبور")
     await human_delay(700, 1000)
-    # بعد ذلك يجب أن تظهر الخيارات الإضافية أو زر المواعيد
 
 # ---------- استقبال الخيار الإضافي ----------
 @dp.message(BookingStates.extra_options)
@@ -290,7 +291,6 @@ async def extra_option_input(message: types.Message, state: FSMContext):
         return
 
     user_choice = message.text.strip()
-    # نحاول مطابقة النص أو الرقم (تبسيط)
     first_options = raw[0]['options']
     selected = None
     if user_choice.isdigit():
@@ -306,7 +306,6 @@ async def extra_option_input(message: types.Message, state: FSMContext):
         await message.answer("اختيار غير صحيح، حاول مجددًا:")
         return
 
-    # حفظ الاختيار (القيمة أو النص)
     await state.update_data(extra_selections=[selected['value'] if selected.get('value') else selected['text']])
     await message.answer("تم استلام الاختيار. أدخل التاريخ (YYYY-MM-DD):")
     await state.set_state(BookingStates.waiting_for_date)
@@ -352,35 +351,27 @@ async def start_monitor(cb: types.CallbackQuery, state: FSMContext):
 
     page = await get_page(user_id)
     try:
-        # الانتقال إلى صفحة المواعيد النهائية
         await go_to_appointments_page(page, data)
-        # بدء مهمة المراقبة في الخلفية
         asyncio.create_task(monitor_and_book(page, data, cb.message.chat.id, cb.from_user.id))
     except Exception as e:
-        await bot.send_message(cb.message.chat.id, f"خطأ في التحضير: {e}")
+        logger.error(f"خطأ في تحضير صفحة المواعيد: {e}")
+        await bot.send_message(cb.message.chat.id, f"فشل تجهيز المراقبة: {e}")
         await state.clear()
     await cb.answer()
 
 async def go_to_appointments_page(page, data):
-    """ينتقل إلى صفحة المواعيد مباشرة (قد تحتاج لضغط زر 'المواعيد')"""
-    # نعيد استخدام go_until_extra_options ثم نضغط على زر المواعيد
     await go_until_extra_options(page, data['purpose'])
-    # تطبيق الاختيار الإضافي إن وجد
     extra = data.get("extra_selections", [])
     if extra:
-        # نضغط على العنصر المناسب (قد يكون select option أو راديو)
-        # نحاول اختيار القيمة
         try:
-            await page.select_option("select", extra[0])  # إذا كان select
+            await page.select_option("select", extra[0])
         except:
-            # وإلا نحاول الضغط على label يحتوي النص
             await human_click(page, f"text={extra[0]}")
         await human_delay(500, 800)
-    # اضغط زر "المواعيد"
     await human_click(page, "button:has-text('المواعيد'), a:has-text('المواعيد')")
     await human_delay(1000, 1500)
 
-# ---------- المراقبة الذكية (بدون تحديث متكرر للصفحة) ----------
+# ---------- المراقبة الذكية ----------
 async def monitor_and_book(page, data, chat_id, user_id):
     target_date = data["date"]
     target_time = data["time"]
@@ -388,20 +379,13 @@ async def monitor_and_book(page, data, chat_id, user_id):
     start = datetime.now()
     logger.info(f"بدء المراقبة للمستخدم {user_id} - التاريخ {target_date} الوقت {target_time}")
 
-    # كود JavaScript لفحص ظهور المواعيد (قد تختلف المحددات)
     check_js = """() => {
-        // أزرار المواعيد المتاحة (مثل btn-success أو غير معطلة)
         const availableButtons = document.querySelectorAll('button.btn-success, .time-slot:not([disabled]), td.available');
         if (availableButtons.length > 0) return true;
-
-        // اختفاء رسالة "لا توجد مواعيد متاحة"
         const noSlots = document.querySelector('.alert.alert-warning, .no-slots, :contains("لا توجد")');
         if (noSlots && noSlots.offsetParent !== null) return false;
-
-        // إذا كان هناك جدول مواعيد بدون رسالة "لا يوجد"، اعتبر أن المواعيد متاحة
         const table = document.querySelector('table.table-bordered');
         if (table && !noSlots) return true;
-
         return false;
     }"""
 
@@ -409,29 +393,26 @@ async def monitor_and_book(page, data, chat_id, user_id):
         try:
             slots_available = await page.evaluate(check_js)
         except Exception as e:
-            logger.warning(f"خطأ في فحص DOM: {e}")
+            logger.warning(f"خطأ فحص DOM: {e}")
             slots_available = False
 
         if slots_available:
             logger.info("تم اكتشاف مواعيد متاحة!")
             try:
-                # اختيار التاريخ (إذا كان هناك حقل تاريخ)
                 date_input = await page.query_selector("input[type='date'], input.datepicker")
                 if date_input:
                     await date_input.fill(target_date)
                     await human_delay(100, 200)
 
-                # اختيار الوقت: نضغط على زر يحمل الوقت المطلوب
                 time_selector = f"button:has-text('{target_time}'), td:has-text('{target_time}')"
                 time_elem = await page.query_selector(time_selector)
                 if time_elem:
                     await human_click(page, time_selector)
                 else:
-                    # إن لم يجد الوقت المحدد، نضغط على أول موعد متاح
                     first_available = await page.query_selector("button.btn-success, .time-slot:not([disabled])")
                     if first_available:
                         await first_available.click()
-                        logger.info("تم اختيار أول موعد متاح (الوقت المحدد غير موجود)")
+                        logger.info("تم اختيار أول موعد متاح")
 
                 await human_delay(200, 400)
                 await human_click(page, "button:has-text('التالي')")
@@ -439,7 +420,6 @@ async def monitor_and_book(page, data, chat_id, user_id):
                 await human_click(page, "button:has-text('تقديم الطلب')")
                 await human_delay(1500, 2500)
 
-                # قراءة النتيجة
                 success = await page.query_selector("text=تم الحجز بنجاح") or await page.query_selector(".alert-success")
                 if success:
                     text = await success.inner_text()
@@ -449,10 +429,10 @@ async def monitor_and_book(page, data, chat_id, user_id):
                     await bot.send_message(chat_id, f"❌ لم يتم الحجز:\n{error_text[:500]}")
                 return
             except Exception as e:
-                await bot.send_message(chat_id, f"⚠️ خطأ أثناء الحجز: {e}")
+                logger.error(f"خطأ أثناء الحجز: {e}")
+                await bot.send_message(chat_id, f"⚠️ حدث خطأ أثناء الحجز: {e}")
                 return
 
-        # انتظر قبل الفحص التالي (1-2 ثانية) لتجنب الحظر
         await asyncio.sleep(random.uniform(1.0, 2.0))
 
     await bot.send_message(chat_id, "⏳ انتهت مدة المراقبة (ساعة) دون ظهور مواعيد. يمكنك المحاولة لاحقًا.")
