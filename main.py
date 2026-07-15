@@ -16,7 +16,7 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = "ضع_توكن_البوت_هنا"          # استبدله بتوكن بوت تيليجرام
+BOT_TOKEN = "8661589595:AAEh22n0-Od7pMJxsLT7GORHOyAWX4PFWsU"          # استبدله بتوكن بوت تيليجرام
 TARGET_URL = "https://www.fasah.sa"    # رابط الموقع الرسمي
 
 # يفضل ترك headless=False لتجربة المتصفح، وللموبايل اجعلها True
