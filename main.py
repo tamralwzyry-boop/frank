@@ -16,11 +16,11 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# التوكن: يُفضل استخدام متغير بيئة، وإلا استخدم القيمة المباشرة
+# التوكن (يمكن تجاوزه بمتغير بيئة BOT_TOKEN)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8661589595:AAEh22n0-Od7pMJxsLT7GORHOyAWX4PFWsU")
-TARGET_URL = "https://www.fasah.sa"    # رابط الموقع الرسمي
+TARGET_URL = "https://www.fasah.sa"    # رابط موقع فسح
 
-# الوضع المخفي: True للتشغيل على السيرفرات (مثل Railway)، False للتجارب المحلية
+# الوضع المخفي: True للتشغيل على السيرفرات (مثل Railway)، False للتجارب المحلية (سيرفر بلا واجهة رسومية يجب أن يكون True)
 HEADLESS_MODE = os.getenv("HEADLESS", "true").lower() == "true"
 
 USER_AGENTS = [
@@ -101,7 +101,6 @@ async def human_click(page, selector):
         await element.scroll_into_view_if_needed()
         box = await element.bounding_box()
         if box:
-            # حركة ماوس عشوائية
             start_x = box['x'] + box['width'] * random.uniform(0.2, 0.8)
             start_y = box['y'] + box['height'] * random.uniform(0.2, 0.8)
             await page.mouse.move(start_x, start_y)
@@ -165,7 +164,6 @@ async def existing_login(cb: types.CallbackQuery, state: FSMContext):
     try:
         page = await get_page(user_id)
         await page.goto(TARGET_URL, wait_until="domcontentloaded")
-        # التحقق إذا كنا مسجلين (قد يظهر رابط "حسابي" أو "تسجيل خروج")
         if await page.query_selector("text=تسجيل الخروج") or await page.query_selector("text=حسابي"):
             await cb.message.answer(f"تم استعادة جلسة {email}.")
             await state.update_data(email=email, logged_in=True)
@@ -194,14 +192,107 @@ async def process_new_password(message: types.Message, state: FSMContext):
     try:
         page = await get_page(user_id)
         await page.goto(TARGET_URL, wait_until="domcontentloaded")
-        # ابحث عن حقول الإدخال
-        await page.fill("input[type='email'], input[name='email'], input#email", email)
-        await page.fill("input[type='password'], input[name='password'], input#password", password)
-        await human_click(page, "button:has-text('دخول'), button:has-text('تسجيل الدخول')")
-        await page.wait_for_load_state("networkidle")
-        await human_delay(1000, 2000)
+        logger.info("تم فتح الصفحة الرئيسية")
 
-        if await page.query_selector("text=تسجيل الخروج") or await page.query_selector("text=حسابي"):
+        # انتظر تحميل الجسم
+        await page.wait_for_selector("body", state="visible", timeout=10000)
+
+        # حاول النقر على رابط/زر تسجيل الدخول إن لم تظهر الحقول مباشرة
+        login_triggers = [
+            "a:has-text('تسجيل الدخول')",
+            "button:has-text('تسجيل الدخول')",
+            "a:has-text('دخول')",
+            "button:has-text('دخول')",
+            "a:has-text('تسجيل')",
+            "button:has-text('تسجيل')",
+        ]
+        for trigger in login_triggers:
+            try:
+                btn = await page.wait_for_selector(trigger, state="visible", timeout=3000)
+                if btn:
+                    await human_click(page, trigger)
+                    logger.info(f"تم الضغط على {trigger}")
+                    await human_delay(1000, 2000)
+                    break
+            except:
+                continue
+
+        # محاولة ملء البريد الإلكتروني
+        email_selectors = [
+            "input[type='email']",
+            "input[name='email']",
+            "input#email",
+            "input[placeholder*='بريد']",
+            "input[placeholder*='إيميل']",
+            "input[aria-label*='بريد']",
+            "input[aria-label*='email']"
+        ]
+        filled = False
+        for sel in email_selectors:
+            try:
+                await page.fill(sel, email)
+                logger.info(f"تم ملء البريد باستخدام: {sel}")
+                filled = True
+                break
+            except:
+                continue
+        if not filled:
+            raise Exception("لم يتم العثور على حقل البريد الإلكتروني")
+
+        # ملء كلمة المرور
+        password_selectors = [
+            "input[type='password']",
+            "input[name='password']",
+            "input#password",
+            "input[placeholder*='مرور']",
+            "input[placeholder*='كلمة']",
+            "input[aria-label*='مرور']",
+            "input[aria-label*='password']"
+        ]
+        filled = False
+        for sel in password_selectors:
+            try:
+                await page.fill(sel, password)
+                logger.info(f"تم ملء كلمة المرور باستخدام: {sel}")
+                filled = True
+                break
+            except:
+                continue
+        if not filled:
+            raise Exception("لم يتم العثور على حقل كلمة المرور")
+
+        # الضغط على زر الدخول
+        submit_selectors = [
+            "button:has-text('دخول')",
+            "button:has-text('تسجيل الدخول')",
+            "input[type='submit'][value*='دخول']",
+            "button[type='submit']",
+            "button:has-text('موافق')",
+            "button:has-text('التالي')"
+        ]
+        clicked = False
+        for sel in submit_selectors:
+            try:
+                await human_click(page, sel)
+                logger.info(f"تم الضغط على زر الدخول: {sel}")
+                clicked = True
+                break
+            except:
+                continue
+        if not clicked:
+            raise Exception("لم يتم العثور على زر الدخول")
+
+        await page.wait_for_load_state("networkidle")
+        await human_delay(2000, 3000)
+
+        # التحقق من نجاح الدخول
+        success = (
+            await page.query_selector("text=تسجيل الخروج") or 
+            await page.query_selector("text=حسابي") or
+            await page.query_selector("text=لوحة التحكم") or
+            await page.query_selector(".user-name")
+        )
+        if success:
             accounts = load_accounts()
             if user_id not in accounts:
                 accounts[user_id] = []
@@ -212,11 +303,17 @@ async def process_new_password(message: types.Message, state: FSMContext):
             await message.answer("تم تسجيل الدخول بنجاح!")
             await ask_purpose(message, state)
         else:
-            await message.answer("فشل الدخول، تحقق من البيانات أو أعد المحاولة لاحقًا.")
+            # قد يكون هناك رسالة خطأ
+            error_msg = await page.query_selector(".alert-danger, .error, .message-error")
+            if error_msg:
+                text = await error_msg.inner_text()
+                await message.answer(f"فشل الدخول: {text}")
+            else:
+                await message.answer("فشل الدخول. تأكد من البيانات.")
             await state.clear()
     except Exception as e:
         logger.error(f"خطأ تسجيل الدخول: {e}")
-        await message.answer(f"حدث خطأ أثناء الدخول. تأكد من صحة البيانات وحاول مجددًا.")
+        await message.answer(f"حدث خطأ أثناء الدخول: {e}")
         await state.clear()
 
 # ---------- سؤال الغرض ----------
