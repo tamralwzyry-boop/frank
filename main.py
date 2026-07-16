@@ -12,7 +12,6 @@ from aiogram.types import (
     BufferedInputFile
 )
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
-from playwright_stealth import stealth_async  # <-- الجديد
 
 # ================== الإعدادات ==================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -20,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8661589595:AAEh22n0-Od7pMJxsLT7GORHOyAWX4PFWsU")
 TARGET_URL = "https://www.fasah.sa"
+
+# سيتم استخدام وضع headless فقط لمتصفح السيرفر. الوضع المحلي يتطلب متصفحك الحقيقي.
 HEADLESS_MODE = os.getenv("HEADLESS", "true").lower() == "true"
 
 USER_AGENTS = [
@@ -40,61 +41,75 @@ def save_accounts(data):
     with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-user_browsers = {}
-user_pages = {}
+# ================== إدارة الجلسات ==================
+# سنخزن جلسة لكل مستخدم: نوعها (local_server / remote_user)، ومتصفحها
+user_sessions = {}  # {user_id: {"type": ..., "browser", "context", "page"}}
 
-async def get_browser_context(user_id: str):
-    if user_id not in user_browsers:
-        p = await async_playwright().start()
+async def get_session(user_id: str, mode: str):
+    """
+    إنشاء أو استرداد جلسة حسب النمط:
+    mode = "remote": يتصل بمتصفح المستخدم المحلي على localhost:9222
+    mode = "local": يشغل متصفح كروميوم على السيرفر
+    """
+    if user_id in user_sessions:
+        return user_sessions[user_id]
+
+    p = await async_playwright().start()
+    if mode == "remote":
+        try:
+            browser = await p.chromium.connect_over_cdp("http://localhost:9222")
+            # استخدام السياق الأول أو إنشاء واحد جديد
+            context = browser.contexts[0] if browser.contexts else await browser.new_context()
+            page = await context.new_page()
+            session = {"type": "remote", "browser": browser, "context": context, "page": page}
+            user_sessions[user_id] = session
+            return session
+        except Exception as e:
+            raise Exception(f"❌ تعذر الاتصال بمتصفحك المحلي. تأكد أن Chrome يعمل على منفذ 9222.\nالخطأ: {e}")
+
+    else:  # local server browser
         try:
             browser = await p.chromium.launch(
                 headless=HEADLESS_MODE,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu"
-                ]
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"]
             )
         except Exception as e:
-            logger.error(f"فشل تشغيل المتصفح: {e}")
-            raise
+            raise Exception(f"فشل تشغيل المتصفح: {e}")
         context = await browser.new_context(
             user_agent=random.choice(USER_AGENTS),
             viewport=VIEWPORT,
             locale="ar-SA",
-            timezone_id="Asia/Riyadh",       # توقيت السعودية
+            timezone_id="Asia/Riyadh"
         )
-        # تطبيق stealth على السياق (يخفي كل شيء)
-        await stealth_async(context)
-        # إضافة init script للتأكيد
+        # تطبيق stealth إذا كانت المكتبة موجودة
+        try:
+            from playwright_stealth import stealth_async
+            await stealth_async(context)
+        except ImportError:
+            logger.warning("playwright-stealth غير مثبتة، قد يكون الكشف سهلاً")
         await context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
-        user_browsers[user_id] = (browser, context)
-    else:
-        browser, context = user_browsers[user_id]
-    return browser, context
-
-async def get_page(user_id: str):
-    if user_id not in user_pages:
-        _, context = await get_browser_context(user_id)
         page = await context.new_page()
-        # تطبيق stealth على الصفحة كذلك (بعض الحالات)
-        await stealth_async(page)
-        user_pages[user_id] = page
-    else:
-        page = user_pages[user_id]
-    return page
+        session = {"type": "local", "browser": browser, "context": context, "page": page}
+        user_sessions[user_id] = session
+        return session
 
-async def close_user_browser(user_id: str):
-    if user_id in user_browsers:
-        browser, context = user_browsers.pop(user_id)
-        await context.close()
-        await browser.close()
-    if user_id in user_pages:
-        user_pages.pop(user_id)
+async def close_session(user_id: str):
+    if user_id in user_sessions:
+        session = user_sessions.pop(user_id)
+        try:
+            await session["page"].close()
+            await session["context"].close()
+            if session["type"] == "local":
+                await session["browser"].close()
+            else:
+                # لا نغلق متصفح المستخدم
+                pass
+        except:
+            pass
 
+# ================== تفاعلات بشرية ==================
 async def human_delay(min_ms=80, max_ms=300):
     await asyncio.sleep(random.uniform(min_ms/1000, max_ms/1000))
 
@@ -104,6 +119,7 @@ async def human_click(page, selector):
         await element.scroll_into_view_if_needed()
         box = await element.bounding_box()
         if box:
+            # حركة ماوس عشوائية تدريجية
             start_x = box['x'] + box['width'] * random.uniform(0.2, 0.8)
             start_y = box['y'] + box['height'] * random.uniform(0.2, 0.8)
             await page.mouse.move(start_x, start_y)
@@ -114,18 +130,20 @@ async def human_click(page, selector):
         else:
             await element.click()
     except PlaywrightTimeout:
-        # إرسال لقطة تلقائياً عند الفشل
         raise Exception(f"العنصر '{selector}' لم يظهر")
 
 async def human_type(page, element, text):
+    """يكتب النص حرفاً حرفاً مع تأخيرات طبيعية"""
     await element.click()
-    await human_delay(100, 200)
-    await element.fill("")
+    await human_delay(100, 250)
+    await element.fill("")  # مسح المحتوى
     await human_delay(50, 100)
     for char in text:
         await page.keyboard.type(char)
         await asyncio.sleep(random.uniform(0.05, 0.15))
+    await human_delay(50, 100)
 
+# ================== حالات FSM ==================
 class States(StatesGroup):
     choosing_mode = State()
     interactive = State()
@@ -137,7 +155,9 @@ class States(StatesGroup):
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
+# ================== أدوات البحث عن العناصر ==================
 async def find_and_click_by_text(page, text):
+    """يبحث عن زر/رابط يحتوي النص. إذا تعدد، يعرض قائمة."""
     candidates = []
     all_buttons = await page.query_selector_all("a, button, [role='button'], input[type='submit'], input[type='button']")
     for btn in all_buttons:
@@ -145,52 +165,87 @@ async def find_and_click_by_text(page, text):
         if text.lower() in txt.lower().strip():
             candidates.append(btn)
     if not candidates:
-        return False, "لم أجد عنصرًا يحتوي هذا النص"
+        return False, "لم أجد عنصرًا يحتوي هذا النص بين الأزرار والروابط"
     if len(candidates) == 1:
-        await human_click(page, candidates[0])
+        # استخدام human_click مع النص للراحة
+        await human_click(page, f"text='{text}'")
         return True, None
     else:
         choices = [(i, (await btn.inner_text()).strip()[:60]) for i, btn in enumerate(candidates)]
         return "multiple", choices
 
+# ================== /start ==================
 @dp.message(F.text == "/start")
 async def start(message: types.Message, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🖱️ تفاعلي (أنا أتحكم)", callback_data="manual")],
+        [InlineKeyboardButton(text="🖥️ اتصال بمتصفحي المحلي (أقوى حماية)", callback_data="remote")],
+        [InlineKeyboardButton(text="☁️ تشغيل على السيرفر (متصفح مخفي)", callback_data="local")],
     ])
-    await message.answer("مرحبًا! سأفتح موقع فسح ويمكنك توجيهي.\nاختر الوضع:", reply_markup=kb)
+    await message.answer(
+        "اختر طريقة تشغيل المتصفح:\n\n"
+        "1️⃣ <b>متصفحي المحلي</b>: تحتاج تشغيل Chrome مع <code>--remote-debugging-port=9222</code> على جهازك.\n"
+        "2️⃣ <b>السيرفر</b>: المتصفح يعمل على Railway (قد تكتشفه بعض المواقع).",
+        reply_markup=kb, parse_mode="HTML"
+    )
     await state.set_state(States.choosing_mode)
 
-@dp.callback_query(F.data == "manual", States.choosing_mode)
-async def manual_mode(cb: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "remote", States.choosing_mode)
+async def choose_remote(cb: types.CallbackQuery, state: FSMContext):
     user_id = str(cb.from_user.id)
-    page = await get_page(user_id)
-    await page.goto(TARGET_URL, wait_until="domcontentloaded")
-    await human_delay(1000)
-    screenshot = await page.screenshot()
-    await cb.message.answer_photo(
-        BufferedInputFile(screenshot, filename="start.png"),
-        caption="الصفحة الرئيسية. أرسل الأوامر."
-    )
-    await state.set_state(States.interactive)
+    try:
+        session = await get_session(user_id, "remote")
+        page = session["page"]
+        await page.goto(TARGET_URL, wait_until="domcontentloaded")
+        await human_delay(1000)
+        screenshot = await page.screenshot()
+        await cb.message.answer_photo(
+            BufferedInputFile(screenshot, filename="remote_start.png"),
+            caption="✅ تم الاتصال بمتصفحك المحلي. أرسل الأوامر الآن:\n- `انقر على ...`\n- `اكتب ... في ...`\n- `لقطة`\n- `اضغط Enter`"
+        )
+        await state.set_state(States.interactive)
+    except Exception as e:
+        await cb.message.answer(f"❌ {e}")
     await cb.answer()
 
+@dp.callback_query(F.data == "local", States.choosing_mode)
+async def choose_local(cb: types.CallbackQuery, state: FSMContext):
+    user_id = str(cb.from_user.id)
+    try:
+        session = await get_session(user_id, "local")
+        page = session["page"]
+        await page.goto(TARGET_URL, wait_until="domcontentloaded")
+        await human_delay(1000)
+        screenshot = await page.screenshot()
+        await cb.message.answer_photo(
+            BufferedInputFile(screenshot, filename="local_start.png"),
+            caption="✅ تم تشغيل المتصفح على السيرفر. أرسل الأوامر:\n- `انقر على ...`\n- `اكتب ... في ...`\n- `لقطة`\n- `اضغط Enter`"
+        )
+        await state.set_state(States.interactive)
+    except Exception as e:
+        await cb.message.answer(f"❌ {e}")
+    await cb.answer()
+
+# ================== الوضع التفاعلي ==================
 @dp.message(States.interactive)
-async def handle_interactive(message: types.Message, state: FSMContext):
+async def interactive_handler(message: types.Message, state: FSMContext):
     text = message.text.strip()
     user_id = str(message.from_user.id)
-    page = await get_page(user_id)
+    session = user_sessions.get(user_id)
+    if not session:
+        await message.answer("لا توجد جلسة نشطة. أرسل /start.")
+        return
+    page = session["page"]
 
-    async def send_error(selector):
-        screenshot = await page.screenshot()
-        await message.answer_photo(
-            BufferedInputFile(screenshot, filename="error.png"),
-            caption=f"❌ فشل في إيجاد العنصر: {selector}\nتحقق من اللقطة وأعد المحاولة."
-        )
+    # تحليل الأوامر
+    cmd_click = re.match(r"انقر على (.+)", text)
+    cmd_type = re.match(r"اكتب (.+?) في (.+)", text)
+    cmd_screenshot = re.match(r"لقطة|صورة", text)
+    cmd_enter = re.match(r"اضغط Enter|Enter", text)
+    cmd_tab = re.match(r"اضغط Tab|Tab", text)
 
     try:
-        if match := re.match(r"انقر على (.+)", text):
-            target = match.group(1).strip()
+        if cmd_click:
+            target = cmd_click.group(1).strip()
             res, extra = await find_and_click_by_text(page, target)
             if res == True:
                 await human_delay(500, 1000)
@@ -199,13 +254,15 @@ async def handle_interactive(message: types.Message, state: FSMContext):
             elif res == "multiple":
                 opts = "\n".join([f"{i+1}. {t}" for i, t in extra])
                 await state.update_data(click_choices=extra)
-                await message.answer(f"وجدت عدة عناصر:\n{opts}\nأرسل الرقم.")
+                await message.answer(f"وجدت عدة عناصر:\n{opts}\nأرسل الرقم المطلوب.")
                 await state.set_state(States.choose_element)
             else:
-                await send_error(target)
-        elif match := re.match(r"اكتب (.+?) في (.+)", text):
-            value = match.group(1).strip()
-            field_desc = match.group(2).strip()
+                await message.answer(f"❌ {extra}")
+
+        elif cmd_type:
+            value = cmd_type.group(1).strip()
+            field_desc = cmd_type.group(2).strip()
+            # البحث عن الحقل المناسب
             locators = [
                 f"input[placeholder*='{field_desc}']",
                 f"input[aria-label*='{field_desc}']",
@@ -221,35 +278,56 @@ async def handle_interactive(message: types.Message, state: FSMContext):
                 except:
                     continue
             if not field:
-                await send_error(f"حقل: {field_desc}")
-                return
-            await human_type(page, field, value)
-            await human_delay(200)
+                # محاولة مطابقة النص القريب
+                all_inputs = await page.query_selector_all("input:visible")
+                for inp in all_inputs:
+                    near = await inp.evaluate("el => (el.labels?.[0]?.innerText || el.placeholder || '')")
+                    if field_desc.lower() in near.lower():
+                        field = inp
+                        break
+            if not field:
+                await message.answer(f"❌ لم أجد حقلًا يطابق '{field_desc}'")
+            else:
+                # استخدام الكتابة البشرية في وضع السيرفر، والعادية في المحلي
+                if session["type"] == "local":
+                    await human_type(page, field, value)
+                else:
+                    # في المتصفح المحلي نستخدم fill عادية (لكن يمكن استخدام human_type أيضاً)
+                    await field.click()
+                    await field.fill(value)
+                await human_delay(200)
+                screenshot = await page.screenshot()
+                await message.answer_photo(BufferedInputFile(screenshot, filename="typed.png"), caption=f"تمت كتابة '{value}'")
+
+        elif cmd_screenshot:
             screenshot = await page.screenshot()
-            await message.answer_photo(BufferedInputFile(screenshot, filename="typed.png"), caption=f"تمت كتابة '{value}'")
-        elif re.match(r"لقطة|صورة", text):
-            screenshot = await page.screenshot()
-            await message.answer_photo(BufferedInputFile(screenshot, filename="screenshot.png"))
-        elif re.match(r"اضغط Enter|Enter", text):
+            await message.answer_photo(BufferedInputFile(screenshot, filename="screen.png"), caption="لقطة الشاشة الحالية")
+
+        elif cmd_enter:
             await page.keyboard.press("Enter")
             await human_delay(500)
             screenshot = await page.screenshot()
-            await message.answer_photo(BufferedInputFile(screenshot, filename="enter.png"), caption="Enter")
-        elif re.match(r"اضغط Tab|Tab", text):
+            await message.answer_photo(BufferedInputFile(screenshot, filename="enter.png"), caption="تم الضغط Enter")
+
+        elif cmd_tab:
             await page.keyboard.press("Tab")
             await human_delay(200)
             screenshot = await page.screenshot()
-            await message.answer_photo(BufferedInputFile(screenshot, filename="tab.png"))
+            await message.answer_photo(BufferedInputFile(screenshot, filename="tab.png"), caption="تم الانتقال للحقل التالي")
+
         elif text == "بدء المراقبة":
-            await message.answer("أدخل التاريخ (YYYY-MM-DD):")
+            await message.answer("أدخل التاريخ المطلوب (YYYY-MM-DD):")
             await state.set_state(States.waiting_for_date)
+
         else:
-            await message.answer("الأوامر: `انقر على ...`، `اكتب ... في ...`، `اضغط Enter`، `لقطة`")
+            await message.answer("أوامر غير معروفة. جرّب:\n- `انقر على ...`\n- `اكتب ... في ...`\n- `اضغط Enter`\n- `اضغط Tab`\n- `لقطة`\n- `بدء المراقبة`")
+
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"خطأ في التفاعل: {e}")
         screenshot = await page.screenshot()
         await message.answer_photo(BufferedInputFile(screenshot, filename="error.png"), caption=f"⚠️ حدث خطأ: {e}")
 
+# ================== اختيار عنصر من قائمة ==================
 @dp.message(States.choose_element)
 async def choose_element_handler(message: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -258,20 +336,28 @@ async def choose_element_handler(message: types.Message, state: FSMContext):
         idx = int(message.text.strip()) - 1
         if 0 <= idx < len(choices):
             target_text = choices[idx][1]
-            page = await get_page(str(message.from_user.id))
-            res, _ = await find_and_click_by_text(page, target_text)
-            if res == True:
-                await human_delay(500)
-                screenshot = await page.screenshot()
-                await message.answer_photo(BufferedInputFile(screenshot, filename="chosen.png"), caption=f"تم النقر على '{target_text}'")
-            else:
-                await message.answer("فشل النقر.")
+            session = user_sessions.get(str(message.from_user.id))
+            if not session:
+                await message.answer("لا توجد جلسة نشطة.")
+                return
+            page = session["page"]
+            # نجرب النقر باستخدام النص المختار
+            try:
+                await human_click(page, f"text='{target_text}'")
+            except:
+                await message.answer("فشل النقر على العنصر.")
+                await state.set_state(States.interactive)
+                return
+            await human_delay(500)
+            screenshot = await page.screenshot()
+            await message.answer_photo(BufferedInputFile(screenshot, filename="chosen.png"), caption=f"تم النقر على '{target_text}'")
             await state.set_state(States.interactive)
         else:
             await message.answer("رقم غير صحيح.")
     except ValueError:
-        await message.answer("أرسل رقمًا.")
+        await message.answer("أرسل رقمًا صحيحًا.")
 
+# ================== إعدادات المراقبة ==================
 @dp.message(States.waiting_for_date)
 async def date_entered(message: types.Message, state: FSMContext):
     if not re.match(r"\d{4}-\d{2}-\d{2}", message.text):
@@ -288,7 +374,7 @@ async def time_entered(message: types.Message, state: FSMContext):
         return
     await state.update_data(time=message.text.strip())
     data = await state.get_data()
-    summary = f"التاريخ: {data['date']}\nالوقت: {data['time']}\nابدأ المراقبة؟"
+    summary = f"التاريخ: {data['date']}\nالوقت: {data['time']}\nابدأ المراقبة الآن؟"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 ابدأ المراقبة", callback_data="start_monitor_btn")]
     ])
@@ -297,18 +383,25 @@ async def time_entered(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "start_monitor_btn")
 async def start_monitor_btn(cb: types.CallbackQuery, state: FSMContext):
     user_id = str(cb.from_user.id)
+    session = user_sessions.get(user_id)
+    if not session:
+        await cb.message.answer("لا توجد جلسة نشطة. أرسل /start.")
+        return
     data = await state.get_data()
-    page = await get_page(user_id)
-    await cb.message.answer("المراقبة الذكية تعمل الآن... سأخبرك فور ظهور موعد.")
+    page = session["page"]
+    await cb.message.answer("🔍 بدأت المراقبة الذكية... ستصلك رسالة فور ظهور موعد.")
     asyncio.create_task(monitor_and_book(page, data, cb.message.chat.id))
     await state.set_state(States.monitoring)
     await cb.answer()
 
+# ================== المراقبة الخاطفة (بدون تحديث) ==================
 async def monitor_and_book(page, data, chat_id):
     target_date = data["date"]
     target_time = data["time"]
     max_minutes = 60
     start = datetime.now()
+    logger.info("بدء مراقبة DOM...")
+
     check_js = """() => {
         const available = document.querySelectorAll('button.time-slot:not([disabled]), .available-slot, td.available');
         if (available.length > 0) return true;
@@ -323,12 +416,14 @@ async def monitor_and_book(page, data, chat_id):
         }
         return false;
     }"""
+
     while (datetime.now() - start) < timedelta(minutes=max_minutes):
         try:
             available = await page.evaluate(check_js)
         except:
             available = False
         if available:
+            logger.info("تم اكتشاف موعد!")
             try:
                 date_input = await page.query_selector("input[type='date'], input.datepicker")
                 if date_input:
@@ -357,10 +452,11 @@ async def monitor_and_book(page, data, chat_id):
                 await bot.send_message(chat_id, f"⚠️ خطأ أثناء الحجز: {e}")
                 return
         await asyncio.sleep(random.uniform(1.0, 2.0))
-    await bot.send_message(chat_id, "⏳ انتهت المراقبة (ساعة) دون مواعيد.")
+    await bot.send_message(chat_id, "⏳ انتهت المراقبة (ساعة) دون ظهور مواعيد.")
 
+# ================== تشغيل البوت ==================
 async def main():
-    logger.info("البوت التفاعلي المتطور يعمل...")
+    logger.info("البوت الذكي مع خيار المتصفح المحلي قيد التشغيل...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
