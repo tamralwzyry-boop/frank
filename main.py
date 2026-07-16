@@ -12,6 +12,7 @@ from aiogram.types import (
     BufferedInputFile
 )
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+from playwright_stealth import stealth_async  # <-- الجديد
 
 # ================== الإعدادات ==================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -48,7 +49,12 @@ async def get_browser_context(user_id: str):
         try:
             browser = await p.chromium.launch(
                 headless=HEADLESS_MODE,
-                args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"]
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu"
+                ]
             )
         except Exception as e:
             logger.error(f"فشل تشغيل المتصفح: {e}")
@@ -56,8 +62,12 @@ async def get_browser_context(user_id: str):
         context = await browser.new_context(
             user_agent=random.choice(USER_AGENTS),
             viewport=VIEWPORT,
-            locale="ar-SA"
+            locale="ar-SA",
+            timezone_id="Asia/Riyadh",       # توقيت السعودية
         )
+        # تطبيق stealth على السياق (يخفي كل شيء)
+        await stealth_async(context)
+        # إضافة init script للتأكيد
         await context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
@@ -70,6 +80,8 @@ async def get_page(user_id: str):
     if user_id not in user_pages:
         _, context = await get_browser_context(user_id)
         page = await context.new_page()
+        # تطبيق stealth على الصفحة كذلك (بعض الحالات)
+        await stealth_async(page)
         user_pages[user_id] = page
     else:
         page = user_pages[user_id]
@@ -92,7 +104,6 @@ async def human_click(page, selector):
         await element.scroll_into_view_if_needed()
         box = await element.bounding_box()
         if box:
-            # حركة ماوس تدريجية
             start_x = box['x'] + box['width'] * random.uniform(0.2, 0.8)
             start_y = box['y'] + box['height'] * random.uniform(0.2, 0.8)
             await page.mouse.move(start_x, start_y)
@@ -103,22 +114,18 @@ async def human_click(page, selector):
         else:
             await element.click()
     except PlaywrightTimeout:
+        # إرسال لقطة تلقائياً عند الفشل
         raise Exception(f"العنصر '{selector}' لم يظهر")
 
-# ================== الكتابة البشرية (حرف حرف) ==================
 async def human_type(page, element, text):
-    """يكتب النص حرفًا حرفًا مع تأخيرات عشوائية."""
     await element.click()
     await human_delay(100, 200)
-    # امسح المحتوى القديم (اختياري)
     await element.fill("")
     await human_delay(50, 100)
     for char in text:
         await page.keyboard.type(char)
-        await asyncio.sleep(random.uniform(0.05, 0.15))  # تأخير بين الحروف
-    await human_delay(50, 100)
+        await asyncio.sleep(random.uniform(0.05, 0.15))
 
-# ================== حالات المحادثة ==================
 class States(StatesGroup):
     choosing_mode = State()
     interactive = State()
@@ -130,9 +137,7 @@ class States(StatesGroup):
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# ================== أدوات البحث الذكية ==================
 async def find_and_click_by_text(page, text):
-    """يبحث عن زر أو رابط يحتوي النص المطلوب، مع تجاهل النصوص العادية. إذا تعددت، يعرض قائمة."""
     candidates = []
     all_buttons = await page.query_selector_all("a, button, [role='button'], input[type='submit'], input[type='button']")
     for btn in all_buttons:
@@ -140,24 +145,20 @@ async def find_and_click_by_text(page, text):
         if text.lower() in txt.lower().strip():
             candidates.append(btn)
     if not candidates:
-        return False, "لم أجد عنصرًا يحتوي هذا النص بين الأزرار والروابط."
+        return False, "لم أجد عنصرًا يحتوي هذا النص"
     if len(candidates) == 1:
         await human_click(page, candidates[0])
         return True, None
     else:
-        choices = []
-        for i, btn in enumerate(candidates):
-            txt = await btn.inner_text()
-            choices.append((i, txt.strip()[:60]))
+        choices = [(i, (await btn.inner_text()).strip()[:60]) for i, btn in enumerate(candidates)]
         return "multiple", choices
 
-# ================== البداية ==================
 @dp.message(F.text == "/start")
 async def start(message: types.Message, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🖱️ تفاعلي (أنا أتحكم)", callback_data="manual")],
     ])
-    await message.answer("مرحبًا! سأفتح لك موقع فسح ويمكنك توجيهي خطوة بخطوة.\nاختر الوضع:", reply_markup=kb)
+    await message.answer("مرحبًا! سأفتح موقع فسح ويمكنك توجيهي.\nاختر الوضع:", reply_markup=kb)
     await state.set_state(States.choosing_mode)
 
 @dp.callback_query(F.data == "manual", States.choosing_mode)
@@ -169,117 +170,86 @@ async def manual_mode(cb: types.CallbackQuery, state: FSMContext):
     screenshot = await page.screenshot()
     await cb.message.answer_photo(
         BufferedInputFile(screenshot, filename="start.png"),
-        caption="الصفحة الرئيسية. أرسل لي أوامرك:\n- `انقر على <النص>`\n- `اكتب <القيمة> في <وصف الحقل>`\n- `اضغط Tab`\n- `اضغط Enter`\n- `لقطة`\n- `امسح الحقل`\n- `بدء المراقبة` (عند وصولك لجدول المواعيد)"
+        caption="الصفحة الرئيسية. أرسل الأوامر."
     )
     await state.set_state(States.interactive)
     await cb.answer()
 
-# ================== تنفيذ الأوامر التفاعلية ==================
 @dp.message(States.interactive)
 async def handle_interactive(message: types.Message, state: FSMContext):
     text = message.text.strip()
     user_id = str(message.from_user.id)
     page = await get_page(user_id)
 
-    # ---- انقر على ... ----
-    if match := re.match(r"انقر على (.+)", text):
-        target = match.group(1).strip()
-        res, extra = await find_and_click_by_text(page, target)
-        if res == True:
-            await human_delay(500, 1000)
-            screenshot = await page.screenshot()
-            await message.answer_photo(BufferedInputFile(screenshot, filename="clicked.png"), caption=f"تم النقر على '{target}'")
-        elif res == "multiple":
-            opts = "\n".join([f"{i+1}. {t}" for i, t in extra])
-            await state.update_data(click_choices=extra)
-            await message.answer(f"وجدت عدة عناصر:\n{opts}\nأرسل رقم العنصر.")
-            await state.set_state(States.choose_element)
-        else:
-            await message.answer(f"❌ {extra}")
+    async def send_error(selector):
+        screenshot = await page.screenshot()
+        await message.answer_photo(
+            BufferedInputFile(screenshot, filename="error.png"),
+            caption=f"❌ فشل في إيجاد العنصر: {selector}\nتحقق من اللقطة وأعد المحاولة."
+        )
 
-    # ---- اكتب ... في ... ----
-    elif match := re.match(r"اكتب (.+?) في (.+)", text):
-        value = match.group(1).strip()
-        field_desc = match.group(2).strip()
-        # نبحث عن حقل قريب من الوصف (placeholder, label, aria-label)
-        locators = [
-            f"input[placeholder*='{field_desc}']",
-            f"input[aria-label*='{field_desc}']",
-            f"label:has-text('{field_desc}') + input",
-            f"label:has-text('{field_desc}') ~ input",
-        ]
-        field = None
-        for loc in locators:
-            try:
-                field = await page.query_selector(loc)
-                if field:
-                    break
-            except:
-                continue
-        if not field:
-            # نجرب كل الحقول الظاهرة ونختار الذي قبله نص قريب
-            all_inputs = await page.query_selector_all("input:visible")
-            for inp in all_inputs:
-                text_near = await inp.evaluate("el => (el.labels?.[0]?.innerText || el.placeholder || '')")
-                if field_desc.lower() in text_near.lower():
-                    field = inp
-                    break
-        if not field:
-            await message.answer(f"❌ لم أجد حقلًا يطابق '{field_desc}'. تأكد من الوصف أو استخدم `اضغط Tab` للتنقل له.")
-        else:
+    try:
+        if match := re.match(r"انقر على (.+)", text):
+            target = match.group(1).strip()
+            res, extra = await find_and_click_by_text(page, target)
+            if res == True:
+                await human_delay(500, 1000)
+                screenshot = await page.screenshot()
+                await message.answer_photo(BufferedInputFile(screenshot, filename="clicked.png"), caption=f"تم النقر على '{target}'")
+            elif res == "multiple":
+                opts = "\n".join([f"{i+1}. {t}" for i, t in extra])
+                await state.update_data(click_choices=extra)
+                await message.answer(f"وجدت عدة عناصر:\n{opts}\nأرسل الرقم.")
+                await state.set_state(States.choose_element)
+            else:
+                await send_error(target)
+        elif match := re.match(r"اكتب (.+?) في (.+)", text):
+            value = match.group(1).strip()
+            field_desc = match.group(2).strip()
+            locators = [
+                f"input[placeholder*='{field_desc}']",
+                f"input[aria-label*='{field_desc}']",
+                f"label:has-text('{field_desc}') + input",
+                f"label:has-text('{field_desc}') ~ input",
+            ]
+            field = None
+            for loc in locators:
+                try:
+                    field = await page.query_selector(loc)
+                    if field:
+                        break
+                except:
+                    continue
+            if not field:
+                await send_error(f"حقل: {field_desc}")
+                return
             await human_type(page, field, value)
             await human_delay(200)
             screenshot = await page.screenshot()
             await message.answer_photo(BufferedInputFile(screenshot, filename="typed.png"), caption=f"تمت كتابة '{value}'")
-
-    # ---- لقطة ----
-    elif re.match(r"لقطة|صورة", text):
-        screenshot = await page.screenshot()
-        await message.answer_photo(BufferedInputFile(screenshot, filename="screenshot.png"), caption="الصفحة الحالية")
-
-    # ---- اضغط Enter ----
-    elif re.match(r"اضغط Enter|Enter", text):
-        await page.keyboard.press("Enter")
-        await human_delay(500)
-        screenshot = await page.screenshot()
-        await message.answer_photo(BufferedInputFile(screenshot, filename="enter.png"), caption="تم الضغط على Enter")
-
-    # ---- اضغط Tab ----
-    elif re.match(r"اضغط Tab|Tab", text):
-        await page.keyboard.press("Tab")
-        await human_delay(200)
-        screenshot = await page.screenshot()
-        await message.answer_photo(BufferedInputFile(screenshot, filename="tab.png"), caption="تم الانتقال إلى الحقل التالي (Tab)")
-
-    # ---- امسح الحقل ----
-    elif match := re.match(r"امسح الحقل(?:\s+(.+))?", text):
-        field_desc = match.group(1).strip() if match.group(1) else ""
-        # إذا حدد وصف
-        if field_desc:
-            locators = [f"input[placeholder*='{field_desc}']", f"input[aria-label*='{field_desc}']"]
-            for loc in locators:
-                field = await page.query_selector(loc)
-                if field:
-                    await field.click()
-                    await field.fill("")
-                    break
+        elif re.match(r"لقطة|صورة", text):
+            screenshot = await page.screenshot()
+            await message.answer_photo(BufferedInputFile(screenshot, filename="screenshot.png"))
+        elif re.match(r"اضغط Enter|Enter", text):
+            await page.keyboard.press("Enter")
+            await human_delay(500)
+            screenshot = await page.screenshot()
+            await message.answer_photo(BufferedInputFile(screenshot, filename="enter.png"), caption="Enter")
+        elif re.match(r"اضغط Tab|Tab", text):
+            await page.keyboard.press("Tab")
+            await human_delay(200)
+            screenshot = await page.screenshot()
+            await message.answer_photo(BufferedInputFile(screenshot, filename="tab.png"))
+        elif text == "بدء المراقبة":
+            await message.answer("أدخل التاريخ (YYYY-MM-DD):")
+            await state.set_state(States.waiting_for_date)
         else:
-            # امسح الحقل النشط
-            await page.keyboard.press("Control+A")
-            await page.keyboard.press("Backspace")
-        await human_delay(200)
+            await message.answer("الأوامر: `انقر على ...`، `اكتب ... في ...`، `اضغط Enter`، `لقطة`")
+    except Exception as e:
+        logger.error(f"Error: {e}")
         screenshot = await page.screenshot()
-        await message.answer_photo(BufferedInputFile(screenshot, filename="cleared.png"), caption="تم مسح الحقل")
+        await message.answer_photo(BufferedInputFile(screenshot, filename="error.png"), caption=f"⚠️ حدث خطأ: {e}")
 
-    # ---- بدء المراقبة ----
-    elif text == "بدء المراقبة":
-        await message.answer("أدخل التاريخ المطلوب (YYYY-MM-DD):")
-        await state.set_state(States.waiting_for_date)
-
-    else:
-        await message.answer("لم أفهم. الأوامر: `انقر على ...`، `اكتب ... في ...`، `اضغط Tab`، `اضغط Enter`، `لقطة`، `امسح الحقل`.")
-
-# ================== اختيار عنصر من قائمة ==================
 @dp.message(States.choose_element)
 async def choose_element_handler(message: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -295,14 +265,13 @@ async def choose_element_handler(message: types.Message, state: FSMContext):
                 screenshot = await page.screenshot()
                 await message.answer_photo(BufferedInputFile(screenshot, filename="chosen.png"), caption=f"تم النقر على '{target_text}'")
             else:
-                await message.answer("فشل النقر، ربما تغيرت الصفحة.")
+                await message.answer("فشل النقر.")
             await state.set_state(States.interactive)
         else:
             await message.answer("رقم غير صحيح.")
     except ValueError:
-        await message.answer("أرسل رقمًا صحيحًا.")
+        await message.answer("أرسل رقمًا.")
 
-# ================== إعدادات المراقبة ==================
 @dp.message(States.waiting_for_date)
 async def date_entered(message: types.Message, state: FSMContext):
     if not re.match(r"\d{4}-\d{2}-\d{2}", message.text):
@@ -335,7 +304,6 @@ async def start_monitor_btn(cb: types.CallbackQuery, state: FSMContext):
     await state.set_state(States.monitoring)
     await cb.answer()
 
-# ================== المراقبة الخاطفة (بدون F5) ==================
 async def monitor_and_book(page, data, chat_id):
     target_date = data["date"]
     target_time = data["time"]
@@ -391,7 +359,6 @@ async def monitor_and_book(page, data, chat_id):
         await asyncio.sleep(random.uniform(1.0, 2.0))
     await bot.send_message(chat_id, "⏳ انتهت المراقبة (ساعة) دون مواعيد.")
 
-# ================== تشغيل البوت ==================
 async def main():
     logger.info("البوت التفاعلي المتطور يعمل...")
     await dp.start_polling(bot)
